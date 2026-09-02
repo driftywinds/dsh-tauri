@@ -9,8 +9,10 @@ src-tauri/target/
 **/*.rs.bk
 
 # --- Tauri build / generated output ---
-dist/
 src-tauri/gen/
+# DO NOT gitignore dist/ — it contains the required frontendDist
+# (dist/index.html) that tauri build needs, even though this app
+# navigates away from it to dsh web.
 
 # --- OS detritus ---
 .DS_Store
