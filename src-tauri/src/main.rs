@@ -1,8 +1,8 @@
-// Prevents an additional console window on Windows in release builds.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Prevents an additional console window on Windows in all builds.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::net::TcpStream;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,8 @@ fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Spawns `dsh web`.
+/// Spawns `dsh web` without showing a console window and without opening
+/// a browser window.
 ///
 /// On Windows, `dsh` is very often a `.cmd`/`.bat`/`.ps1` shim rather than a
 /// raw `.exe` (common for CLIs installed via npm/cargo wrapper scripts).
@@ -36,16 +37,29 @@ fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
 /// calls `CreateProcess` directly and only auto-appends `.exe`, so it fails
 /// with "not found" even though the same name works in your shell. Routing
 /// through `cmd /C` restores that PATHEXT resolution.
+/// `CREATE_NO_WINDOW` suppresses the CMD console window.
 fn spawn_dsh() -> std::io::Result<Child> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
         Command::new("cmd")
             .args(["/C", "dsh", "web", "--no-open"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
             .spawn()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Command::new("dsh").args(["web", "--no-open"]).spawn()
+        Command::new("dsh")
+            .args(["web", "--no-open"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
     }
 }
 
@@ -69,6 +83,9 @@ fn kill_dsh(state: &DshProcess) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(DshProcess(Mutex::new(None)))
         .setup(|app| {
             let child = spawn_dsh().expect(
@@ -102,8 +119,17 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { .. } = event {
-                kill_dsh(&window.state::<DshProcess>());
+            match event {
+                WindowEvent::CloseRequested { .. } => {
+                    kill_dsh(&window.state::<DshProcess>());
+                }
+                // If a new window is created (e.g. dsh web opens a second
+                // window via JS), immediately close it so only the main
+                // window remains.
+                WindowEvent::Focused { .. } if window.label() != "main" => {
+                    let _ = window.close();
+                }
+                _ => {}
             }
         })
         .build(tauri::generate_context!())
@@ -114,6 +140,16 @@ fn main() {
             // (e.g. Cmd+Q on macOS, or the process being killed externally).
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 kill_dsh(&app_handle.state::<DshProcess>());
+            }
+
+            // Kill any windows that aren't the main window (prevents
+            // dsh web UI from spawning extra browser/webview windows).
+            if let tauri::RunEvent::WindowEvent { label, .. } = event {
+                if label != "main" {
+                    if let Some(w) = app_handle.get_webview_window(&label) {
+                        let _ = w.close();
+                    }
+                }
             }
         });
 }
