@@ -1,0 +1,43 @@
+# --- Node / npm ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn.lock
+
+# --- Rust / Cargo ---
+src-tauri/target/
+**/*.rs.bk
+
+# --- Tauri build / generated output ---
+dist/
+src-tauri/gen/
+
+# --- OS detritus ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# --- Environment ---
+.env
+.env.local
+.env.*.local
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Misc ---
+*.pyc
+__pycache__/
+.pytest_cache/
+.coverage

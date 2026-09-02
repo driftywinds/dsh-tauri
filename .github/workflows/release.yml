@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: ubuntu-latest
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extension: .AppImage
+            artifact_name: deepseek-harness-x86_64.AppImage
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            extension: .dmg
+            artifact_name: deepseek-harness-x86_64.dmg
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            extension: .dmg
+            artifact_name: deepseek-harness-aarch64.dmg
+          - name: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: .msi
+            artifact_name: deepseek-harness-x86_64.msi
+
+    runs-on: ${{ matrix.platform.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Install Linux system dependencies
+        if: matrix.platform.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Get version from Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version ' src-tauri/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "crate_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build Tauri app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run build
+
+      - name: Locate and rename artifact
+        id: artifact
+        shell: bash
+        run: |
+          # Tauri outputs vary by platform:
+          #   Linux:   src-tauri/target/release/bundle/appimage/   *.AppImage
+          #   macOS:   src-tauri/target/release/bundle/dmg/        *.dmg
+          #   Windows: src-tauri/target/release/bundle/msi/        *.msi
+          BUNDLE_DIR="src-tauri/target/release/bundle"
+          if [ -d "$BUNDLE_DIR/appimage" ]; then
+            FILE=$(ls "$BUNDLE_DIR/appimage/"*.AppImage 2>/dev/null | head -1)
+          elif [ -d "$BUNDLE_DIR/dmg" ]; then
+            FILE=$(ls "$BUNDLE_DIR/dmg/"*.dmg 2>/dev/null | head -1)
+          elif [ -d "$BUNDLE_DIR/msi" ]; then
+            FILE=$(ls "$BUNDLE_DIR/msi/"*.msi 2>/dev/null | head -1)
+          fi
+          echo "artifact_path=$FILE" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${{ matrix.platform.artifact_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.artifact_name }}
+          path: ${{ steps.artifact.outputs.artifact_path }}
+          if-no-files-found: error
+
+  create-release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          draft: true
+          files: |
+            deepseek-harness-x86_64.AppImage/*
+            deepseek-harness-x86_64.dmg/*
+            deepseek-harness-aarch64.dmg/*
+            deepseek-harness-x86_64.msi/*
