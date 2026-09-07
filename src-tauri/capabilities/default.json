@@ -3,12 +3,19 @@
   "identifier": "default",
   "description": "Capability for the main window",
   "windows": ["main"],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:3080/*",
+      "http://127.0.0.1:3080/**"
+    ]
+  },
   "permissions": [
     "core:default",
     "core:window:allow-close",
     "core:window:allow-show",
     "core:window:allow-set-focus",
     "core:window:allow-center",
+    "core:window:allow-start-dragging",
 
     "fs:read-all",
     "fs:write-all",

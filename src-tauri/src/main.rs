@@ -13,6 +13,46 @@ const DSH_HOST: &str = "127.0.0.1";
 const DSH_PORT: u16 = 3080;
 const DSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Makes the frameless window draggable from anywhere in the webview
+/// content. On mousedown we start a window drag unless the target is a
+/// button, link, input, textarea, select, or already opted out via
+/// `class="no-drag"` or `-webkit-app-region: no-drag`.
+///
+/// This is passed to `initialization_script`, which (unlike a one-off
+/// `window.eval(...)` call) is re-injected before *every* page load —
+/// including the initial "about:blank" placeholder and the later
+/// navigation to `http://localhost:3080`. A plain `eval` only touches
+/// whatever page happens to be loaded the instant it runs, so it would be
+/// wiped out the moment the window navigates to the real dsh UI.
+///
+/// Requires `"withGlobalTauri": true` in `tauri.conf.json` (so
+/// `window.__TAURI__` exists) and the `core:window:allow-start-dragging`
+/// permission in `capabilities/default.json`.
+const DRAG_REGION_SCRIPT: &str = r#"
+    (function () {
+        var SKIP_TAGS = { A: 1, BUTTON: 1, INPUT: 1, TEXTAREA: 1, SELECT: 1, OPTION: 1 };
+
+        document.addEventListener('mousedown', function (event) {
+            if (event.button !== 0) return; // left click only
+
+            var target = event.target;
+            if (!target || SKIP_TAGS[target.tagName]) return;
+
+            var classList = target.className;
+            if (typeof classList === 'string' && classList.split(' ').indexOf('no-drag') !== -1) {
+                return;
+            }
+            var region = window.getComputedStyle(target).getPropertyValue('-webkit-app-region');
+            if (region && region.trim() === 'no-drag') return;
+
+            var tauriWindow = window.__TAURI__ && window.__TAURI__.window;
+            if (tauriWindow && typeof tauriWindow.getCurrentWindow === 'function') {
+                tauriWindow.getCurrentWindow().startDragging();
+            }
+        });
+    })();
+"#;
+
 /// Holds the handle to the spawned `dsh web` child process so it can be
 /// killed when the app shuts down.
 struct DshProcess(Mutex<Option<Child>>);
@@ -99,35 +139,36 @@ fn main() {
                 *state.0.lock().unwrap() = Some(child);
             }
 
-            let window = app
-                .get_webview_window("main")
-                .expect("main window not found — check tauri.conf.json");
+            // The "main" window has `"create": false` in tauri.conf.json, so
+            // Tauri does *not* auto-create it at startup — we build it here
+            // ourselves from that same config, which lets us attach
+            // `DRAG_REGION_SCRIPT` as a real initialization script (see its
+            // doc comment for why a one-off `.eval()` isn't good enough).
+            let window_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .expect("`main` window not found in tauri.conf.json")
+                .clone();
 
-            // Make the frameless window draggable from anywhere in the
-            // webview content.  On mousedown we start a window drag unless
-            // the target is a button, link, input, textarea, select, or
-            // already has -webkit-app-region: no-drag set.
-            let _ = window.eval(r#"
-                (function () {
-                    var skipTags = { 'A': true, 'BUTTON': true, 'INPUT': true,
-                                     'TEXTAREA': true, 'SELECT': true, 'OPTION': true };
-                    var skipClasses = { 'no-drag': true };
-                    document.addEventListener('mousedown', function (e) {
-                        var target = e.target;
-                        var tag = target.tagName;
-                        if (skipTags[tag]) return;
-                        if (target.className && skipClasses[target.className.split(' ')[0]]) return;
-                        var region = window.getComputedStyle(target).getPropertyValue('-webkit-app-region');
-                        if (region && region.trim() === 'no-drag') return;
-                        // Only start drag on left button
-                        if (e.button !== 0) return;
-                        var win = window.__TAURI__ || window.__tauri;
-                        if (win && win.window && win.window('main') && win.window('main').startDrag) {
-                            try { win.window('main').startDrag(); } catch (_) {}
-                        }
-                    });
-                })();
-            "#);
+            // `.drag_and_drop(false)` disables Tauri's *native* OS-level
+            // drag-drop handler (used for dropping files onto the window).
+            // That handler is ON by default and, on Windows/WebView2,
+            // intercepts drag-related mouse events before they ever reach
+            // our JS — silently eating the exact mousedown→drag sequence
+            // `startDragging()` needs, no matter how correct the JS is.
+            // Setting `dragDropEnabled: false` in tauri.conf.json alone
+            // does NOT work here: there's a known Tauri bug where that
+            // config field is ignored for windows built via
+            // `WebviewWindowBuilder::from_config` (which is why it's also
+            // forced explicitly here rather than left to the config).
+            let window = tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+                .initialization_script(DRAG_REGION_SCRIPT)
+                .drag_and_drop(false)
+                .build()
+                .expect("failed to build main window");
 
             std::thread::spawn(move || {
                 if wait_for_port(DSH_HOST, DSH_PORT, DSH_READY_TIMEOUT) {

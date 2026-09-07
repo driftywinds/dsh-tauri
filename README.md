@@ -99,3 +99,57 @@ This will produce all required platform formats, including `icon.icns`.
 - **Permissions**: `capabilities/default.json` is intentionally minimal
   (just `core:default` plus window show/close). Add more capabilities
   only if you add features that need them.
+- **Dragging the frameless window**: since `decorations` is `false`,
+  there's no OS titlebar to grab, so `main.rs` injects a small script
+  (`DRAG_REGION_SCRIPT`) that starts a window drag on left-mousedown
+  anywhere in the page (except on links/buttons/inputs/etc., or elements
+  marked `class="no-drag"` / `-webkit-app-region: no-drag`). Three things
+  have to line up for this to actually work:
+  - `"withGlobalTauri": true` in `tauri.conf.json`, so `window.__TAURI__`
+    exists in the page's JS. Note this exposes the Tauri JS API to
+    whatever `dsh web` serves at `localhost:3080` — fine here since `dsh`
+    is your own trusted process, but worth knowing.
+  - `"core:window:allow-start-dragging"` in `capabilities/default.json`,
+    since Tauri blocks every command by default until it's explicitly
+    permitted.
+  - The script has to be a real *initialization script*
+    (`initialization_script(...)`), not a one-off `window.eval(...)`.
+    `eval` only affects whatever page happens to be loaded at that
+    instant; since this app navigates from `about:blank` to
+    `http://localhost:3080`, an eval'd listener on the first page is
+    gone the moment that navigation happens. An initialization script is
+    re-injected before every page load instead, so it survives the
+    navigation.
+  - Because the window needs a custom initialization script, it's built
+    by hand in `setup()` via `WebviewWindowBuilder::from_config(...)`
+    rather than left for Tauri to auto-create — that's what the
+    `"create": false` on the window entry in `tauri.conf.json` is for.
+  - **Windows/WebView2 specifically**: Tauri's native OS-level drag-drop
+    handler (for dropping files onto the window) is *on* by default, and
+    it intercepts drag-related mouse events before they reach the
+    webview's JS — silently eating the mousedown→drag sequence
+    `startDragging()` needs. `main.rs` calls `.drag_and_drop(false)` on
+    the window builder to turn that off. `"dragDropEnabled": false` is
+    also set in `tauri.conf.json` for documentation purposes, but note
+    it has no effect by itself for windows built via
+    `WebviewWindowBuilder::from_config` (a known Tauri bug) — the
+    `.drag_and_drop(false)` builder call is what actually matters.
+  - **The big one — remote origin ACL**: Tauri v2's permission system
+    checks the *origin of the page currently loaded in the webview*, not
+    just the window label. `about:blank` (the initial placeholder) counts
+    as a trusted local origin, but once the window navigates to
+    `http://127.0.0.1:3080`, that's a genuine remote origin as far as
+    Tauri's ACL is concerned. Without explicitly allow-listing it, Tauri
+    silently blocks *every* IPC call — including `start_dragging` — made
+    from that page, regardless of what's in `permissions`. That's what
+    the `"remote": { "urls": [...] }` block in
+    `capabilities/default.json` is for: it extends this capability's
+    permissions (drag included) to pages loaded from
+    `http://127.0.0.1:3080`. **Note it's `127.0.0.1`, not `localhost`** —
+    Tauri's ACL treats them as different origins even though they
+    resolve to the same machine, and it has to match whatever `DSH_HOST`
+    in `main.rs` actually is exactly. If you ever change `DSH_HOST` or
+    `DSH_PORT` in `main.rs`, update this URL list to match, or dragging
+    (and any other IPC call) will silently stop working again — check
+    the WebView2 devtools console (right-click → Inspect) for a
+    `not allowed on window ...` message if that happens.
