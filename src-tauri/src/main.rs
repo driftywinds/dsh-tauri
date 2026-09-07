@@ -1,9 +1,10 @@
 // Prevents an additional console window on Windows in all builds.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -97,28 +98,32 @@ fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
 /// with "not found" even though the same name works in your shell. Routing
 /// through `cmd /C` restores that PATHEXT resolution.
 /// `CREATE_NO_WINDOW` suppresses the CMD console window.
-fn spawn_dsh() -> std::io::Result<Child> {
+fn spawn_dsh() -> std::io::Result<(Child, ChildStdout)> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        Command::new("cmd")
+        let mut child = Command::new("cmd")
             .args(["/C", "dsh", "web", "--no-open"])
             .creation_flags(CREATE_NO_WINDOW)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn()?;
+        let stdout = child.stdout.take().unwrap();
+        Ok((child, stdout))
     }
     #[cfg(not(target_os = "windows"))]
     {
-        Command::new("dsh")
+        let mut child = Command::new("dsh")
             .args(["web", "--no-open"])
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .stdin(Stdio::null())
-            .spawn()
+            .spawn()?;
+        let stdout = child.stdout.take().unwrap();
+        Ok((child, stdout))
     }
 }
 
@@ -221,6 +226,21 @@ fn unique_download_path(dir: &Path, filename: &str) -> PathBuf {
     dir.join(filename)
 }
 
+/// Extract the authenticated dsh web URL from one line of `dsh web` stdout.
+/// Expected line format:  `dsh web: http://127.0.0.1:3080/?token=abc123`
+/// (optionally followed by ` (LAN: http://...?token=...)` which is ignored).
+fn extract_dsh_web_url_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let rest = line.strip_prefix("dsh web: ")?;
+    // Take the first whitespace-delimited token — the loopback URL itself.
+    let url_str = rest.split_whitespace().next()?;
+    if url_str.starts_with("http://") || url_str.starts_with("https://") {
+        Some(url_str.to_string())
+    } else {
+        None
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
@@ -229,7 +249,7 @@ fn main() {
         .manage(DshProcess(Mutex::new(None)))
         .setup(|app| {
             // --- Spawn dsh web and navigate to it once ready ---
-            let child = spawn_dsh().expect(
+            let (child, stdout) = spawn_dsh().expect(
                 "failed to launch `dsh web` — is the `dsh` binary installed and on PATH?",
             );
 
@@ -310,9 +330,50 @@ fn main() {
                 .expect("failed to build main window");
 
             std::thread::spawn(move || {
+                // Read dsh web's stdout line by line until we find the
+                // authenticated URL (which carries the per-process `?token=...`).
+                let authenticated_url = {
+                    let reader = BufReader::new(stdout);
+                    let deadline = Instant::now() + DSH_READY_TIMEOUT;
+                    let mut found_url: Option<String> = None;
+
+                    for line_result in reader.lines() {
+                        if Instant::now() >= deadline {
+                            eprintln!(
+                                "Timed out after {}s waiting for dsh web URL on stdout",
+                                DSH_READY_TIMEOUT.as_secs()
+                            );
+                            return;
+                        }
+                        let line = match line_result {
+                            Ok(l) => l,
+                            Err(e) => {
+                                eprintln!("Error reading dsh web stdout: {e}");
+                                return;
+                            }
+                        };
+                        if let Some(url) = extract_dsh_web_url_line(&line) {
+                            found_url = Some(url);
+                            break;
+                        }
+                    }
+
+                    match found_url {
+                        Some(url) => url,
+                        None => {
+                            eprintln!("dsh web closed stdout before printing the URL");
+                            return;
+                        }
+                    }
+                };
+
+                // The URL is printed once the server is listening (or very
+                // shortly after), but wait for the port to be reachable so we
+                // don't race the TCP listen socket.
                 if wait_for_port(DSH_HOST, DSH_PORT, DSH_READY_TIMEOUT) {
-                    let url = format!("http://{DSH_HOST}:{DSH_PORT}");
-                    let _ = window.eval(&format!("window.location.replace('{url}')"));
+                    let _ = window.eval(&format!(
+                        "window.location.replace('{authenticated_url}')"
+                    ));
                     let _ = window.set_focus();
                 } else {
                     eprintln!(
