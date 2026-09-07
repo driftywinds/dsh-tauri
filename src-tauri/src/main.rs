@@ -6,7 +6,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tauri::{Manager, WindowEvent};
+use tauri::Manager;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 const DSH_HOST: &str = "127.0.0.1";
 const DSH_PORT: u16 = 3080;
@@ -76,8 +77,8 @@ fn kill_dsh(state: &DshProcess) {
                 .output();
         }
         // Best-effort: dsh may have already exited on its own.
+        // Do NOT call child.wait() here — that can block for seconds.
         let _ = child.kill();
-        let _ = child.wait();
     }
 }
 
@@ -88,6 +89,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .manage(DshProcess(Mutex::new(None)))
         .setup(|app| {
+            // --- Spawn dsh web and navigate to it once ready ---
             let child = spawn_dsh().expect(
                 "failed to launch `dsh web` — is the `dsh` binary installed and on PATH?",
             );
@@ -101,12 +103,36 @@ fn main() {
                 .get_webview_window("main")
                 .expect("main window not found — check tauri.conf.json");
 
+            // Make the frameless window draggable from anywhere in the
+            // webview content.  On mousedown we start a window drag unless
+            // the target is a button, link, input, textarea, select, or
+            // already has -webkit-app-region: no-drag set.
+            let _ = window.eval(r#"
+                (function () {
+                    var skipTags = { 'A': true, 'BUTTON': true, 'INPUT': true,
+                                     'TEXTAREA': true, 'SELECT': true, 'OPTION': true };
+                    var skipClasses = { 'no-drag': true };
+                    document.addEventListener('mousedown', function (e) {
+                        var target = e.target;
+                        var tag = target.tagName;
+                        if (skipTags[tag]) return;
+                        if (target.className && skipClasses[target.className.split(' ')[0]]) return;
+                        var region = window.getComputedStyle(target).getPropertyValue('-webkit-app-region');
+                        if (region && region.trim() === 'no-drag') return;
+                        // Only start drag on left button
+                        if (e.button !== 0) return;
+                        var win = window.__TAURI__ || window.__tauri;
+                        if (win && win.window && win.window('main') && win.window('main').startDrag) {
+                            try { win.window('main').startDrag(); } catch (_) {}
+                        }
+                    });
+                })();
+            "#);
+
             std::thread::spawn(move || {
                 if wait_for_port(DSH_HOST, DSH_PORT, DSH_READY_TIMEOUT) {
                     let url = format!("http://{DSH_HOST}:{DSH_PORT}");
-                    // Navigate the existing window to the running dsh web UI, then reveal it.
                     let _ = window.eval(&format!("window.location.replace('{url}')"));
-                    let _ = window.show();
                     let _ = window.set_focus();
                 } else {
                     eprintln!(
@@ -116,21 +142,27 @@ fn main() {
                 }
             });
 
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            match event {
-                WindowEvent::CloseRequested { .. } => {
-                    kill_dsh(&window.state::<DshProcess>());
-                }
-                // If a new window is created (e.g. dsh web opens a second
-                // window via JS), immediately close it so only the main
-                // window remains.
-                WindowEvent::Focused { .. } if window.label() != "main" => {
-                    let _ = window.close();
-                }
-                _ => {}
+            // --- Register Ctrl+Q global shortcut to close the window ---
+            #[cfg(desktop)]
+            {
+                let ctrl_q = Shortcut::new(Some(Modifiers::CONTROL), Code::KeyQ);
+                app.handle().plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(move |_app, shortcut, event| {
+                            if shortcut == &ctrl_q
+                                && event.state() == ShortcutState::Pressed
+                            {
+                                if let Some(window) = _app.get_webview_window("main") {
+                                    let _ = window.close();
+                                }
+                            }
+                        })
+                        .build(),
+                )?;
+                app.global_shortcut().register(ctrl_q)?;
             }
+
+            Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

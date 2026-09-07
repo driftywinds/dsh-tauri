@@ -36,8 +36,36 @@ deepseek-harness-app/
 ```bash
 npm install
 npm run dev      # tauri dev — spawns dsh, opens the window once it's up
-npm run build    # tauri build — produces a native installer/binary
+npm run build    # tauri build — produces the release binary
 ```
+
+## Portable exe (Windows)
+
+The app is built as a standalone `.exe` that does **not** require installation.
+After `npm run build`, the portable executable is at:
+
+```
+src-tauri/target/release/deepseek-harness.exe
+```
+
+Copy that `.exe` to any folder on any Windows 10 (April 2018 update or later)
+or Windows 11 machine and double-click it — no installer, no admin rights,
+no registry changes. The frontend is embedded in the binary, so only the `.exe`
+is needed.
+
+**Prerequisites on the target machine:**
+- Windows 10 (April 2018 update / build 1809 or later) or Windows 11 — these
+  ship with the WebView2 runtime pre-installed.
+- `dsh` must be installed and available on the PATH (the app shells out to
+  `dsh web` at startup).
+
+If you need to support older Windows versions or offline machines, set
+`bundle.windows.webviewInstallMode.type` to `"fixedRuntime"` in
+`tauri.conf.json` and place the WebView2 fixed-version runtime next to the
+`.exe` (see the [Tauri Windows installer docs](https://v2.tauri.app/distribute/windows-installer/)).
+
+To also produce installers (MSI/NSIS), set `bundle.active` back to `true`.
+The portable `.exe` is always built regardless of that setting.
 
 ## Icons
 
