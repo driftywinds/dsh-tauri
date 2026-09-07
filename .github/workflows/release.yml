@@ -155,6 +155,7 @@ jobs:
           fi
 
       - name: Build Tauri app
+        shell: bash
         run: |
           if [ -n "${{ matrix.platform.bundles }}" ]; then
             npx tauri build --bundles ${{ matrix.platform.bundles }}
