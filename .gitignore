@@ -20,6 +20,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+deepseek-harness-master/
 
 # --- Editor / IDE ---
 .vscode/

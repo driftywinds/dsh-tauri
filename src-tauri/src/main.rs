@@ -1,16 +1,25 @@
 // Prevents an additional console window on Windows in all builds.
+//
+// ## Debug output visibility
+// `eprintln!` calls below go to stderr. In a `tauri dev` session the main
+// Tauri process's stderr is forwarded to the terminal you ran `pnpm tauri dev`
+// from, so *all* debug logging is visible there. In a released app
+// (`windows_subsystem = "windows"` suppresses the console) they are silently
+// discarded unless a debugger is attached — the release build is intentionally
+// quiet.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::webview::DownloadEvent;
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use url::Url;
 
 const DSH_HOST: &str = "127.0.0.1";
 const DSH_PORT: u16 = 3080;
@@ -77,13 +86,18 @@ fn drag_region_script() -> String {
 struct DshProcess(Mutex<Option<Child>>);
 
 fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
+    eprintln!("[dsh-tauri] Waiting for {host}:{port} to be reachable (timeout: {}s)…", timeout.as_secs());
     let deadline = Instant::now() + timeout;
+    let mut attempts = 0u32;
     while Instant::now() < deadline {
         if TcpStream::connect((host, port)).is_ok() {
+            eprintln!("[dsh-tauri] Port {port} is reachable (after {attempts} poll(s)).");
             return true;
         }
+        attempts += 1;
         std::thread::sleep(Duration::from_millis(200));
     }
+    eprintln!("[dsh-tauri] Timed out waiting for {host}:{port} after {}s.", timeout.as_secs());
     false
 }
 
@@ -98,7 +112,7 @@ fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
 /// with "not found" even though the same name works in your shell. Routing
 /// through `cmd /C` restores that PATHEXT resolution.
 /// `CREATE_NO_WINDOW` suppresses the CMD console window.
-fn spawn_dsh() -> std::io::Result<(Child, ChildStdout)> {
+fn spawn_dsh() -> std::io::Result<(Child, ChildStdout, ChildStderr)> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -108,40 +122,49 @@ fn spawn_dsh() -> std::io::Result<(Child, ChildStdout)> {
             .args(["/C", "dsh", "web", "--no-open"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Pipe stderr too so the debug reader thread can relay it.
+            .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .spawn()?;
         let stdout = child.stdout.take().unwrap();
-        Ok((child, stdout))
+        let stderr = child.stderr.take().unwrap();
+        Ok((child, stdout, stderr))
     }
     #[cfg(not(target_os = "windows"))]
     {
         let mut child = Command::new("dsh")
             .args(["web", "--no-open"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .spawn()?;
         let stdout = child.stdout.take().unwrap();
-        Ok((child, stdout))
+        let stderr = child.stderr.take().unwrap();
+        Ok((child, stdout, stderr))
     }
 }
 
 fn kill_dsh(state: &DshProcess) {
     if let Some(mut child) = state.0.lock().unwrap().take() {
+        let pid = child.id();
+        eprintln!("[dsh-tauri] Killing dsh web process (PID {pid})…");
         // On Windows, `child` is the `cmd.exe` wrapper — killing it alone
         // leaves the actual `dsh` process (its child) running, since Windows
         // doesn't cascade-kill descendants the way Unix process groups do.
         // `taskkill /T` kills the whole process tree instead.
         #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            let result = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .output();
+            eprintln!("[dsh-tauri] taskkill /T /F (PID {pid}): {result:?}");
         }
         // Best-effort: dsh may have already exited on its own.
         // Do NOT call child.wait() here — that can block for seconds.
         let _ = child.kill();
+        eprintln!("[dsh-tauri] dsh web process killed.");
+    } else {
+        eprintln!("[dsh-tauri] kill_dsh: no child process to kill.");
     }
 }
 
@@ -249,9 +272,11 @@ fn main() {
         .manage(DshProcess(Mutex::new(None)))
         .setup(|app| {
             // --- Spawn dsh web and navigate to it once ready ---
-            let (child, stdout) = spawn_dsh().expect(
+            eprintln!("[dsh-tauri] Spawning `dsh web --no-open`…");
+            let (child, stdout, stderr) = spawn_dsh().expect(
                 "failed to launch `dsh web` — is the `dsh` binary installed and on PATH?",
             );
+            eprintln!("[dsh-tauri] dsh web process spawned (PID {})", child.id());
 
             {
                 let state = app.state::<DshProcess>();
@@ -312,13 +337,13 @@ fn main() {
                                 url.path_segments().and_then(|mut s| s.next_back()),
                             );
                             *destination = unique_download_path(&downloads_dir, &filename);
-                            eprintln!("Downloading {url} -> {}", destination.display());
+                            eprintln!("[dsh-tauri] Downloading {url} -> {}", destination.display());
                         }
                         DownloadEvent::Finished { url, path, success } => {
                             if success {
-                                eprintln!("Download finished: {url} -> {path:?}");
+                                eprintln!("[dsh-tauri] Download finished: {url} -> {path:?}");
                             } else {
-                                eprintln!("Download failed: {url}");
+                                eprintln!("[dsh-tauri] Download failed: {url}");
                             }
                         }
                         _ => {}
@@ -328,6 +353,20 @@ fn main() {
                 })
                 .build()
                 .expect("failed to build main window");
+
+            // Spawn a reader thread that logs every line from dsh web's stderr
+            // (useful when troubleshooting the DSH server itself — .stderr is
+            // piped so the subprocess won't block).
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) => eprintln!("[dsh stderr] {l}"),
+                        Err(e) => eprintln!("[dsh stderr] (read error: {e})"),
+                    }
+                }
+                eprintln!("[dsh stderr] (stream ended)");
+            });
 
             std::thread::spawn(move || {
                 // Read dsh web's stdout line by line until we find the
@@ -340,7 +379,7 @@ fn main() {
                     for line_result in reader.lines() {
                         if Instant::now() >= deadline {
                             eprintln!(
-                                "Timed out after {}s waiting for dsh web URL on stdout",
+                                "[dsh-tauri] Timed out after {}s waiting for dsh web URL on stdout",
                                 DSH_READY_TIMEOUT.as_secs()
                             );
                             return;
@@ -348,11 +387,13 @@ fn main() {
                         let line = match line_result {
                             Ok(l) => l,
                             Err(e) => {
-                                eprintln!("Error reading dsh web stdout: {e}");
+                                eprintln!("[dsh-tauri] Error reading dsh web stdout: {e}");
                                 return;
                             }
                         };
+                        eprintln!("[dsh stdout] {line}");
                         if let Some(url) = extract_dsh_web_url_line(&line) {
+                            eprintln!("[dsh-tauri] Extracted authenticated URL: {url}");
                             found_url = Some(url);
                             break;
                         }
@@ -361,7 +402,7 @@ fn main() {
                     match found_url {
                         Some(url) => url,
                         None => {
-                            eprintln!("dsh web closed stdout before printing the URL");
+                            eprintln!("[dsh-tauri] dsh web closed stdout before printing the URL");
                             return;
                         }
                     }
@@ -370,16 +411,49 @@ fn main() {
                 // The URL is printed once the server is listening (or very
                 // shortly after), but wait for the port to be reachable so we
                 // don't race the TCP listen socket.
-                if wait_for_port(DSH_HOST, DSH_PORT, DSH_READY_TIMEOUT) {
-                    let _ = window.eval(&format!(
-                        "window.location.replace('{authenticated_url}')"
-                    ));
-                    let _ = window.set_focus();
-                } else {
+                if !wait_for_port(DSH_HOST, DSH_PORT, DSH_READY_TIMEOUT) {
                     eprintln!(
-                        "Timed out after {}s waiting for dsh web on {DSH_HOST}:{DSH_PORT}",
-                        DSH_READY_TIMEOUT.as_secs()
+                        "[dsh-tauri] Port {DSH_PORT} never became reachable. Giving up."
                     );
+                    return;
+                }
+
+                // --- Solution A: native WebView navigation ---
+                // Instead of running JS on the about:blank page (which can
+                // create origin-boundary issues with Set-Cookie / SameSite),
+                // use Tauri 2's native navigate() which commands the
+                // WebView2 engine directly at the HTTP level. This ensures
+                // the 303 redirect + Set-Cookie exchange initiated by DSH's
+                // authorizeIndex() works the same as in a real browser.
+                eprintln!("[dsh-tauri] Navigating WebView to authenticated URL…");
+                match Url::parse(&authenticated_url) {
+                    Ok(url) => {
+                        if let Err(e) = window.navigate(url) {
+                            eprintln!("[dsh-tauri] ERROR: window.navigate() failed: {e}");
+                            // Fallback: try eval as a last resort.
+                            eprintln!("[dsh-tauri] Falling back to window.eval()…");
+                            let _ = window.eval(&format!(
+                                "window.location.replace('{authenticated_url}')"
+                            ));
+                        } else {
+                            eprintln!("[dsh-tauri] window.navigate() succeeded.");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[dsh-tauri] ERROR: Url::parse() failed for '{authenticated_url}': {e}");
+                        // Fallback: try eval anyway.
+                        eprintln!("[dsh-tauri] Falling back to window.eval()…");
+                        let _ = window.eval(&format!(
+                            "window.location.replace('{authenticated_url}')"
+                        ));
+                    }
+                }
+
+                // Bring the window to the foreground.
+                if let Err(e) = window.set_focus() {
+                    eprintln!("[dsh-tauri] window.set_focus() failed: {e}");
+                } else {
+                    eprintln!("[dsh-tauri] window.set_focus() succeeded.");
                 }
             });
 
