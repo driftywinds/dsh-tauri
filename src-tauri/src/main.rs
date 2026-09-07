@@ -261,20 +261,21 @@ fn main() {
                 .download_dir()
                 .unwrap_or_else(|_| std::env::temp_dir());
 
-            // `.drag_and_drop(false)` disables Tauri's *native* OS-level
-            // drag-drop handler (used for dropping files onto the window).
-            // That handler is ON by default and, on Windows/WebView2,
-            // intercepts drag-related mouse events before they ever reach
-            // our JS — silently eating the exact mousedown→drag sequence
-            // `startDragging()` needs, no matter how correct the JS is.
-            // Setting `dragDropEnabled: false` in tauri.conf.json alone
-            // does NOT work here: there's a known Tauri bug where that
-            // config field is ignored for windows built via
-            // `WebviewWindowBuilder::from_config` (which is why it's also
-            // forced explicitly here rather than left to the config).
+            // `.disable_drag_drop_handler()` disables Tauri's *native*
+            // OS-level drag-drop handler (used for dropping files onto the
+            // window). That handler is ON by default and, on
+            // Windows/WebView2, intercepts drag-related mouse events before
+            // they ever reach our JS — silently eating the exact
+            // mousedown→drag sequence `startDragging()` needs, no matter
+            // how correct the JS is. Setting `dragDropEnabled: false` in
+            // tauri.conf.json alone does NOT work here: there's a known
+            // Tauri bug where that config field is ignored for windows
+            // built via `WebviewWindowBuilder::from_config` (which is why
+            // it's also forced explicitly here rather than left to the
+            // config).
             let window = tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)?
                 .initialization_script(drag_region_script())
-                .drag_and_drop(false)
+                .disable_drag_drop_handler()
                 // Gives the page (and any "download session log" style
                 // button in dsh's own UI) real file-download capability.
                 // Recent Tauri/wry versions do allow downloads to proceed
