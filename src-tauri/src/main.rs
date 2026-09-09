@@ -410,6 +410,17 @@ fn report_startup_failure(handle: &tauri::AppHandle, heading: &str, details: &st
 
 fn main() {
     tauri::Builder::default()
+        // Must be the FIRST plugin (per its docs): a second app launch exits
+        // during this registration — before setup() — so it can never spawn
+        // its own doomed `dsh web` or fight over port 3080.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // Runs in the FIRST instance when a second launch is blocked:
+            // surface the existing window instead of opening a clone.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
