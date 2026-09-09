@@ -318,7 +318,8 @@ fn main() {
             // built via `WebviewWindowBuilder::from_config` (which is why
             // it's also forced explicitly here rather than left to the
             // config).
-            let window = tauri::WebviewWindowBuilder::from_config(app.handle(), &window_config)?
+            let app_handle = app.handle().clone();
+            let _window = tauri::WebviewWindowBuilder::from_config(&app_handle, &window_config)?
                 .initialization_script(drag_region_script())
                 .disable_drag_drop_handler()
                 // Gives the page (and any "download session log" style
@@ -368,6 +369,9 @@ fn main() {
                 eprintln!("[dsh stderr] (stream ended)");
             });
 
+            // Clone the AppHandle for the stdout reader thread so it can
+            // dispatch navigation back to the main (event-loop) thread later.
+            let navigate_handle = app_handle.clone();
             std::thread::spawn(move || {
                 // Read dsh web's stdout line by line until we find the
                 // authenticated URL (which carries the per-process `?token=...`).
@@ -418,43 +422,54 @@ fn main() {
                     return;
                 }
 
-                // --- Solution A: native WebView navigation ---
-                // Instead of running JS on the about:blank page (which can
-                // create origin-boundary issues with Set-Cookie / SameSite),
-                // use Tauri 2's native navigate() which commands the
-                // WebView2 engine directly at the HTTP level. This ensures
-                // the 303 redirect + Set-Cookie exchange initiated by DSH's
-                // authorizeIndex() works the same as in a real browser.
-                eprintln!("[dsh-tauri] Navigating WebView to authenticated URL…");
-                match Url::parse(&authenticated_url) {
-                    Ok(url) => {
-                        if let Err(e) = window.navigate(url) {
-                            eprintln!("[dsh-tauri] ERROR: window.navigate() failed: {e}");
-                            // Fallback: try eval as a last resort.
+                // Navigate the window on the MAIN event-loop thread so the
+                // WebView2 is guaranteed to be fully created and ready by the
+                // time the closure runs.  Calling navigate() from a raw thread
+                // races window creation (which Tauri queues on the event loop
+                // during from_config+build), and a lost race leaves you staring
+                // at about:blank with a silent failure.
+                let url_for_main = authenticated_url.clone();
+                let closure_handle = navigate_handle.clone();
+                let _ = navigate_handle.run_on_main_thread(move || {
+                    let main_window = match closure_handle.get_webview_window("main") {
+                        Some(w) => w,
+                        None => {
+                            eprintln!("[dsh-tauri] ERROR: main window not found on event loop — navigation aborted.");
+                            return;
+                        }
+                    };
+
+                    eprintln!("[dsh-tauri] Navigating WebView to authenticated URL…");
+                    match Url::parse(&url_for_main) {
+                        Ok(url) => {
+                            if let Err(e) = main_window.navigate(url) {
+                                eprintln!("[dsh-tauri] ERROR: window.navigate() failed: {e}");
+                                // Fallback: try eval as a last resort.
+                                eprintln!("[dsh-tauri] Falling back to window.eval()…");
+                                let _ = main_window.eval(&format!(
+                                    "window.location.replace('{url_for_main}')"
+                                ));
+                            } else {
+                                eprintln!("[dsh-tauri] window.navigate() succeeded.");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[dsh-tauri] ERROR: Url::parse() failed for '{url_for_main}': {e}");
+                            // Fallback: try eval anyway.
                             eprintln!("[dsh-tauri] Falling back to window.eval()…");
-                            let _ = window.eval(&format!(
-                                "window.location.replace('{authenticated_url}')"
+                            let _ = main_window.eval(&format!(
+                                "window.location.replace('{url_for_main}')"
                             ));
-                        } else {
-                            eprintln!("[dsh-tauri] window.navigate() succeeded.");
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[dsh-tauri] ERROR: Url::parse() failed for '{authenticated_url}': {e}");
-                        // Fallback: try eval anyway.
-                        eprintln!("[dsh-tauri] Falling back to window.eval()…");
-                        let _ = window.eval(&format!(
-                            "window.location.replace('{authenticated_url}')"
-                        ));
-                    }
-                }
 
-                // Bring the window to the foreground.
-                if let Err(e) = window.set_focus() {
-                    eprintln!("[dsh-tauri] window.set_focus() failed: {e}");
-                } else {
-                    eprintln!("[dsh-tauri] window.set_focus() succeeded.");
-                }
+                    // Bring the window to the foreground.
+                    if let Err(e) = main_window.set_focus() {
+                        eprintln!("[dsh-tauri] window.set_focus() failed: {e}");
+                    } else {
+                        eprintln!("[dsh-tauri] window.set_focus() succeeded.");
+                    }
+                });
             });
 
             // --- Register Ctrl+Q global shortcut to close the window ---
