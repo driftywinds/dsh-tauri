@@ -46,12 +46,23 @@ jobs:
         run: |
           PLATFORMS='[]'
 
+          # bundle_base: where the tauri build emits its output. Native builds
+          # land in target/release; cross-compiled builds in
+          # target/<rust-triple>/release. bundle_pattern: the bundler also
+          # stages helper files into the bundle directory (e.g. the macOS DMG
+          # volume icon staged as icon.icns next to the real .dmg), so the
+          # artifact locator must match the real bundle's name pattern instead
+          # of grabbing the first file it finds.
+
           if [ "${{ github.event.inputs.build_linux }}" = "true" ]; then
             PLATFORMS=$(echo "$PLATFORMS" | jq '. += [{
               "name": "linux",
               "os": "ubuntu-latest",
               "target": "x86_64-unknown-linux-gnu",
               "bundles": "appimage",
+              "target_flag": "",
+              "bundle_base": "src-tauri/target/release",
+              "bundle_pattern": "*.AppImage",
               "artifact_name": "deepseek-harness-x86_64.AppImage"
             }]')
           fi
@@ -59,9 +70,12 @@ jobs:
           if [ "${{ github.event.inputs.build_macos_x64 }}" = "true" ]; then
             PLATFORMS=$(echo "$PLATFORMS" | jq '. += [{
               "name": "macos-x86_64",
-              "os": "macos-13",
+              "os": "macos-latest",
               "target": "x86_64-apple-darwin",
               "bundles": "dmg",
+              "target_flag": "--target x86_64-apple-darwin",
+              "bundle_base": "src-tauri/target/x86_64-apple-darwin/release",
+              "bundle_pattern": "*.dmg",
               "artifact_name": "deepseek-harness-x86_64.dmg"
             }]')
           fi
@@ -72,6 +86,9 @@ jobs:
               "os": "macos-latest",
               "target": "aarch64-apple-darwin",
               "bundles": "dmg",
+              "target_flag": "",
+              "bundle_base": "src-tauri/target/release",
+              "bundle_pattern": "*.dmg",
               "artifact_name": "deepseek-harness-aarch64.dmg"
             }]')
           fi
@@ -82,6 +99,9 @@ jobs:
               "os": "windows-latest",
               "target": "x86_64-pc-windows-msvc",
               "bundles": "msi",
+              "target_flag": "",
+              "bundle_base": "src-tauri/target/release",
+              "bundle_pattern": "*.msi",
               "artifact_name": "deepseek-harness-x86_64.msi"
             }]')
           fi
@@ -92,6 +112,9 @@ jobs:
               "os": "windows-latest",
               "target": "x86_64-pc-windows-msvc",
               "bundles": "",
+              "target_flag": "",
+              "bundle_base": "src-tauri/target/release",
+              "bundle_pattern": "",
               "artifact_name": "deepseek-harness-x86_64-portable.exe"
             }]')
           fi
@@ -181,10 +204,13 @@ jobs:
       - name: Build Tauri app
         shell: bash
         run: |
+          # target_flag is empty for native builds and "--target <triple>"
+          # when cross-compiling (macOS x86_64 is built on the Apple Silicon
+          # runner; the retired macos-13 Intel runners no longer exist).
           if [ -n "${{ matrix.platform.bundles }}" ]; then
-            npx tauri build --bundles ${{ matrix.platform.bundles }}
+            npx tauri build --bundles ${{ matrix.platform.bundles }} ${{ matrix.platform.target_flag }}
           else
-            npx tauri build
+            npx tauri build ${{ matrix.platform.target_flag }}
           fi
 
       - name: Locate bundle artifact
@@ -192,16 +218,20 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ matrix.platform.bundles }}" ]; then
-            BUNDLE_DIR="src-tauri/target/release/bundle/${{ matrix.platform.bundles }}"
-            FILE=$(find "$BUNDLE_DIR" -maxdepth 1 -type f | head -1)
+            BUNDLE_DIR="${{ matrix.platform.bundle_base }}/bundle/${{ matrix.platform.bundles }}"
+            # Match the real bundle by name pattern: the directory also holds
+            # bundler staging files (the DMG bundler leaves the volume icon
+            # staged as icon.icns there), so a blind `find | head -1` can
+            # pick the wrong file.
+            FILE=$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name "${{ matrix.platform.bundle_pattern }}" | head -1)
             if [ -z "$FILE" ]; then
-              echo "No bundle artifact found in $BUNDLE_DIR"
+              echo "No bundle artifact matching '${{ matrix.platform.bundle_pattern }}' found in $BUNDLE_DIR"
               ls -la "$BUNDLE_DIR" || true
               exit 1
             fi
           else
-            # Portable build: the raw exe is at target/release/<binary>.exe
-            FILE="src-tauri/target/release/deepseek-harness.exe"
+            # Portable build: the raw exe is at <bundle_base>/<binary>.exe
+            FILE="${{ matrix.platform.bundle_base }}/deepseek-harness.exe"
             if [ ! -f "$FILE" ]; then
               echo "Portable exe not found at $FILE"
               ls -la src-tauri/target/release/ || true
