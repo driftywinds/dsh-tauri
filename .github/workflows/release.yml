@@ -137,6 +137,30 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Set version from tag
+        shell: bash
+        run: |
+          # Strip the leading "v" if present, e.g. "v0.3.0" -> "0.3.0"
+          TAG="${{ github.event.inputs.tag }}"
+          VERSION="${TAG#v}"
+
+          echo "Applying version: $VERSION (from tag: $TAG)"
+
+          # Update package.json
+          npm pkg set version="$VERSION"
+          echo "  package.json  -> $VERSION"
+
+          # Update src-tauri/Cargo.toml (cross-platform: -i.bak works on both
+          # GNU and BSD sed; remove the backup afterwards)
+          sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+          rm -f src-tauri/Cargo.toml.bak
+          echo "  Cargo.toml    -> $VERSION"
+
+          # Update src-tauri/tauri.conf.json (top-level "version" only)
+          jq --arg v "$VERSION" '.version = $v' src-tauri/tauri.conf.json > tmp.json \
+            && mv tmp.json src-tauri/tauri.conf.json
+          echo "  tauri.conf.json -> $VERSION"
+
       # dist/index.html is a tiny placeholder committed to the repo as the
       # frontendDist that tauri build requires.  Double-check it exists
       # (if the file was somehow omitted from checkout, recreate it).
