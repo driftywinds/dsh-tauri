@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Minimal capability for the main window. The dsh web UI uses no Tauri IPC except the injected drag-region script (startDragging), so only core defaults plus that one permission are granted. Downloads are handled Rust-side via on_download and uploads use the standard file input, so fs/dialog/shell/global-shortcut permissions were removed: they granted the remote page (http://127.0.0.1:3080) unused filesystem/shell reach that only expanded the attack surface.",
   "windows": ["main"],
   "remote": {
     "urls": [
@@ -11,38 +11,6 @@
   },
   "permissions": [
     "core:default",
-    "core:window:allow-close",
-    "core:window:allow-show",
-    "core:window:allow-set-focus",
-    "core:window:allow-center",
-    "core:window:allow-start-dragging",
-
-    "fs:read-all",
-    "fs:write-all",
-    "fs:allow-home-read-recursive",
-    "fs:allow-home-write-recursive",
-    "fs:allow-app-read-recursive",
-    "fs:allow-app-write-recursive",
-    "fs:allow-temp-read-recursive",
-    "fs:allow-temp-write-recursive",
-    "fs:allow-desktop-read-recursive",
-    "fs:allow-download-read-recursive",
-    "fs:allow-download-write-recursive",
-    "fs:allow-document-read-recursive",
-    "fs:allow-document-write-recursive",
-
-    "dialog:default",
-    "dialog:allow-open",
-    "dialog:allow-save",
-    "dialog:allow-message",
-    "dialog:allow-ask",
-    "dialog:allow-confirm",
-
-    "shell:default",
-    "shell:allow-open",
-
-    "global-shortcut:allow-is-registered",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister"
+    "core:window:allow-start-dragging"
   ]
 }

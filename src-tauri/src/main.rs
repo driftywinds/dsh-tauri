@@ -126,6 +126,13 @@ fn spawn_dsh() -> std::io::Result<(Child, ChildStdout, ChildStderr)> {
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .spawn()?;
+
+        // Bind the whole cmd.exe -> dsh -> node tree to a kill-on-close Job
+        // Object so it dies with this process even if this process crashes or
+        // is killed externally (the graceful path separately uses
+        // taskkill /T /F — see kill_dsh).
+        assign_kill_on_close_job(&child);
+
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         Ok((child, stdout, stderr))
@@ -141,6 +148,65 @@ fn spawn_dsh() -> std::io::Result<(Child, ChildStdout, ChildStderr)> {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         Ok((child, stdout, stderr))
+    }
+}
+
+/// Assigns the spawned `dsh web` child to a Windows Job Object whose only
+/// limit is `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The job handle is
+/// deliberately never closed: the kernel kills every process in the job when
+/// its last handle disappears, i.e. when this process terminates — for any
+/// reason. Graceful close, panic, Task Manager kill, or crash: the whole
+/// `cmd.exe` -> `dsh` -> `node` tree dies with it, so the server can never
+/// outlive the app and squat port 3080 (which made the next launch's
+/// `dsh web` fail to bind and left the app on a blank window).
+///
+/// Best-effort by design: on any failure only a warning is logged and the
+/// previous behavior remains (graceful shutdown still runs `taskkill /T /F`
+/// in `kill_dsh`). Nested jobs are supported since Windows 8, so assignment
+/// also succeeds when this app itself is already inside a job.
+#[cfg(target_os = "windows")]
+fn assign_kill_on_close_job(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            eprintln!(
+                "[dsh-tauri] WARN: CreateJobObjectW failed — the dsh process tree is NOT bound to this process's lifetime; it may survive a crash/force-kill."
+            );
+            return;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            eprintln!(
+                "[dsh-tauri] WARN: SetInformationJobObject failed — the dsh process tree is NOT bound to this process's lifetime; it may survive a crash/force-kill."
+            );
+            return;
+        }
+
+        if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+            eprintln!(
+                "[dsh-tauri] WARN: AssignProcessToJobObject failed — the dsh process tree is NOT bound to this process's lifetime; it may survive a crash/force-kill."
+            );
+            return;
+        }
+
+        eprintln!("[dsh-tauri] dsh web process tree bound to kill-on-close job object.");
+        // `job` is intentionally leaked (no CloseHandle): keeping the handle
+        // alive is what keeps the kill-on-close contract armed.
     }
 }
 

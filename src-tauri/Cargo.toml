@@ -16,6 +16,12 @@ tauri-plugin-shell = "2"
 tauri-plugin-global-shortcut = "2"
 url = "2"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Same version already in Cargo.lock (pulled in by tauri) — reused, not duplicated.
+# Needed for the kill-on-close Job Object that ties the `dsh web` process tree
+# to this process's lifetime.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [[bin]]
 name = "deepseek-harness"
 path = "src/main.rs"
