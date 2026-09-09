@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal capability for the main window. The dsh web UI uses no Tauri IPC except the injected drag-region script (startDragging), so only core defaults plus that one permission are granted. Downloads are handled Rust-side via on_download and uploads use the standard file input, so fs/dialog/shell/global-shortcut permissions were removed: they granted the remote page (http://127.0.0.1:3080) unused filesystem/shell reach that only expanded the attack surface.",
+  "description": "Minimal capability for the main window. The dsh web UI uses no Tauri IPC of its own; the only consumers are the two injected scripts (drag region and the Ctrl+Q close shortcut), so only core defaults plus those two window permissions are granted. Downloads are handled Rust-side via on_download and uploads use the standard file input, so fs/dialog/shell/global-shortcut permissions were removed: they granted the remote page (http://127.0.0.1:3080) unused filesystem/shell reach that only expanded the attack surface.",
   "windows": ["main"],
   "remote": {
     "urls": [
@@ -11,6 +11,7 @@
   },
   "permissions": [
     "core:default",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "core:window:allow-close"
   ]
 }

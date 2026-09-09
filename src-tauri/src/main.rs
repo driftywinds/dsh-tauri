@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use tauri::webview::DownloadEvent;
 use tauri::Manager;
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use url::Url;
 
 const DSH_HOST: &str = "127.0.0.1";
@@ -79,6 +78,33 @@ fn drag_region_script() -> String {
     "#,
         height = DRAG_REGION_HEIGHT_PX
     )
+}
+
+/// Makes Ctrl+Q close the window — window-local, unlike a global shortcut:
+/// the keydown listener lives in the page and only fires while this window
+/// has keyboard focus, so Ctrl+Q keeps its normal meaning in every other
+/// application, and a hotkey collision can never abort startup.
+///
+/// `getCurrentWindow().close()` is an IPC call, so it requires
+/// `core:window:allow-close` in capabilities/default.json. Like the drag
+/// region script, this is re-injected before *every* page load (including
+/// about:blank and the dsh UI), so it also works on the startup error page.
+fn close_shortcut_script() -> String {
+    r#"
+    (function () {
+        document.addEventListener('keydown', function (event) {
+            if (event.defaultPrevented) return; // the page already handled it
+            if (!event.ctrlKey || event.altKey || event.metaKey) return;
+            if (event.code !== 'KeyQ') return; // physical key: layout- and CapsLock-independent
+            var tauriWindow = window.__TAURI__ && window.__TAURI__.window;
+            if (tauriWindow && typeof tauriWindow.getCurrentWindow === 'function') {
+                event.preventDefault();
+                tauriWindow.getCurrentWindow().close();
+            }
+        });
+    })();
+    "#
+    .to_string()
 }
 
 /// Holds the handle to the spawned `dsh web` child process so it can be
@@ -330,6 +356,58 @@ fn extract_dsh_web_url_line(line: &str) -> Option<String> {
     }
 }
 
+/// Renders a fatal-error page into the main window (which sits on
+/// about:blank at startup), replacing the silent white rectangle with the
+/// reason and a hint. The text passes through two encodings, so it is
+/// escaped for both: HTML entities (it is assigned via innerHTML) and
+/// JavaScript string escapes (it rides inside an eval'd single-quoted
+/// string) — error text can neither inject markup nor break the script.
+fn show_error_page(window: &tauri::WebviewWindow, heading: &str, details: &str) {
+    let escape = |s: &str| -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\\', "\\\\")
+            .replace('`', "\\`")
+            .replace("${", "\\${")
+            .replace('\'', "\\'")
+            .replace('\r', "")
+            .replace('\n', "\\n")
+    };
+    let script = format!(
+        r#"(function () {{
+            document.body.style.cssText = 'margin:0;background:#16171a;color:#d7d7db;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;';
+            document.body.innerHTML = '<div style="max-width:660px;padding:0 32px;">'
+                + '<h1 style="font-size:19px;font-weight:600;color:#ff8080;margin:0 0 14px;">{heading}</h1>'
+                + '<pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;margin:0;color:#c7c7cc;">{details}</pre>'
+                + '<p style="font-size:12px;color:#77777d;margin-top:22px;">You can close this window.</p>'
+                + '</div>';
+        }})();"#,
+        heading = escape(heading),
+        details = escape(details),
+    );
+    if let Err(e) = window.eval(&script) {
+        eprintln!("[dsh-tauri] ERROR: could not render the startup error page: {e}");
+    }
+}
+
+/// Surfaces a fatal startup failure in the UI; callable from any thread.
+/// The injection is queued onto the main event-loop thread. When called
+/// during `setup` (before the loop runs) it executes as soon as the loop
+/// starts, by which time the webview exists — a direct `eval` call would
+/// race window creation (see the navigation comment in `main`).
+fn report_startup_failure(handle: &tauri::AppHandle, heading: &str, details: &str) {
+    let heading = heading.to_string();
+    let details = details.to_string();
+    let closure_handle = handle.clone();
+    let _ = handle.run_on_main_thread(move || match closure_handle.get_webview_window("main") {
+        Some(w) => show_error_page(&w, &heading, &details),
+        None => eprintln!(
+            "[dsh-tauri] ERROR: main window not found; startup error could not be shown: {heading}: {details}"
+        ),
+    });
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
@@ -337,18 +415,6 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .manage(DshProcess(Mutex::new(None)))
         .setup(|app| {
-            // --- Spawn dsh web and navigate to it once ready ---
-            eprintln!("[dsh-tauri] Spawning `dsh web --no-open`…");
-            let (child, stdout, stderr) = spawn_dsh().expect(
-                "failed to launch `dsh web` — is the `dsh` binary installed and on PATH?",
-            );
-            eprintln!("[dsh-tauri] dsh web process spawned (PID {})", child.id());
-
-            {
-                let state = app.state::<DshProcess>();
-                *state.0.lock().unwrap() = Some(child);
-            }
-
             // The "main" window has `"create": false` in tauri.conf.json, so
             // Tauri does *not* auto-create it at startup — we build it here
             // ourselves from that same config, which lets us attach
@@ -387,6 +453,7 @@ fn main() {
             let app_handle = app.handle().clone();
             let _window = tauri::WebviewWindowBuilder::from_config(&app_handle, &window_config)?
                 .initialization_script(drag_region_script())
+                .initialization_script(close_shortcut_script())
                 .disable_drag_drop_handler()
                 // Gives the page (and any "download session log" style
                 // button in dsh's own UI) real file-download capability.
@@ -421,6 +488,29 @@ fn main() {
                 .build()
                 .expect("failed to build main window");
 
+            // --- Spawn dsh web ---
+            // Spawned *after* the window exists so a spawn failure (e.g. the
+            // `dsh` CLI is missing) can be rendered in the UI. Panicking here
+            // would be invisible: release builds have no console.
+            eprintln!("[dsh-tauri] Spawning `dsh web --no-open`…");
+            let (child, stdout, stderr) = match spawn_dsh() {
+                Ok(handles) => handles,
+                Err(e) => {
+                    let detail = format!(
+                        "Failed to launch the `dsh` CLI process.\n\nIs `dsh` installed and available on your PATH?\n\nUnderlying error: {e}"
+                    );
+                    eprintln!("[dsh-tauri] FATAL: {detail}");
+                    report_startup_failure(&app_handle, "DeepSeek Harness could not start", &detail);
+                    return Ok(());
+                }
+            };
+            eprintln!("[dsh-tauri] dsh web process spawned (PID {})", child.id());
+
+            {
+                let state = app.state::<DshProcess>();
+                *state.0.lock().unwrap() = Some(child);
+            }
+
             // Spawn a reader thread that logs every line from dsh web's stderr
             // (useful when troubleshooting the DSH server itself — .stderr is
             // piped so the subprocess won't block).
@@ -439,51 +529,93 @@ fn main() {
             // dispatch navigation back to the main (event-loop) thread later.
             let navigate_handle = app_handle.clone();
             std::thread::spawn(move || {
-                // Read dsh web's stdout line by line until we find the
-                // authenticated URL (which carries the per-process `?token=...`).
-                let authenticated_url = {
+                // One global deadline covers both the URL wait and the port
+                // wait. A helper thread forwards stdout lines through a
+                // channel so the wait can time out for real: `reader.lines()`
+                // blocks forever when dsh prints nothing, so a deadline
+                // checked around that blocking read never actually fires.
+                let deadline = Instant::now() + DSH_READY_TIMEOUT;
+                let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+                std::thread::spawn(move || {
                     let reader = BufReader::new(stdout);
-                    let deadline = Instant::now() + DSH_READY_TIMEOUT;
-                    let mut found_url: Option<String> = None;
-
-                    for line_result in reader.lines() {
-                        if Instant::now() >= deadline {
-                            eprintln!(
-                                "[dsh-tauri] Timed out after {}s waiting for dsh web URL on stdout",
-                                DSH_READY_TIMEOUT.as_secs()
-                            );
-                            return;
-                        }
-                        let line = match line_result {
-                            Ok(l) => l,
+                    for line in reader.lines() {
+                        match line {
+                            Ok(l) => {
+                                eprintln!("[dsh stdout] {l}");
+                                // A send error means the waiting side is gone
+                                // (URL found or gave up): stop draining.
+                                if line_tx.send(l).is_err() {
+                                    return;
+                                }
+                            }
                             Err(e) => {
                                 eprintln!("[dsh-tauri] Error reading dsh web stdout: {e}");
                                 return;
                             }
-                        };
-                        eprintln!("[dsh stdout] {line}");
-                        if let Some(url) = extract_dsh_web_url_line(&line) {
-                            eprintln!("[dsh-tauri] Extracted authenticated URL: {url}");
-                            found_url = Some(url);
-                            break;
                         }
                     }
+                });
 
-                    match found_url {
-                        Some(url) => url,
-                        None => {
+                // Consume forwarded lines until the authenticated URL (which
+                // carries the per-process `?token=...`) shows up, the deadline
+                // expires, or stdout closes because dsh exited.
+                let authenticated_url = loop {
+                    match line_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(line) => {
+                            if let Some(url) = extract_dsh_web_url_line(&line) {
+                                eprintln!("[dsh-tauri] Extracted authenticated URL: {url}");
+                                break Some(url);
+                            }
+                            // Not the URL line — keep waiting.
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            eprintln!(
+                                "[dsh-tauri] Timed out after {}s waiting for the dsh web URL on stdout",
+                                DSH_READY_TIMEOUT.as_secs()
+                            );
+                            break None;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             eprintln!("[dsh-tauri] dsh web closed stdout before printing the URL");
-                            return;
+                            break None;
                         }
                     }
                 };
 
+                let Some(authenticated_url) = authenticated_url else {
+                    // Fatal: dsh never reported a URL. Kill the wedged (or
+                    // already dead) process and show the reason instead of
+                    // leaving a silent white window.
+                    eprintln!(
+                        "[dsh-tauri] FATAL: no dsh web URL within {}s",
+                        DSH_READY_TIMEOUT.as_secs()
+                    );
+                    kill_dsh(&navigate_handle.state::<DshProcess>());
+                    report_startup_failure(
+                        &navigate_handle,
+                        "DeepSeek Harness server did not start",
+                        "The `dsh web` process never reported its web address.\n\nPossible causes:\n  - the `dsh` CLI crashed at startup\n  - port 3080 is already taken by another program\n  - the server needed longer than the 30 second startup budget\n\nRun `dsh web --no-open` in a terminal to see the underlying error.",
+                    );
+                    return;
+                };
+
                 // The URL is printed once the server is listening (or very
                 // shortly after), but wait for the port to be reachable so we
-                // don't race the TCP listen socket.
-                if !wait_for_port(DSH_HOST, DSH_PORT, DSH_READY_TIMEOUT) {
-                    eprintln!(
-                        "[dsh-tauri] Port {DSH_PORT} never became reachable. Giving up."
+                // don't race the TCP listen socket. What remains of the global
+                // deadline bounds this wait too.
+                if !wait_for_port(
+                    DSH_HOST,
+                    DSH_PORT,
+                    deadline.saturating_duration_since(Instant::now()),
+                ) {
+                    eprintln!("[dsh-tauri] Port {DSH_PORT} never became reachable. Giving up.");
+                    kill_dsh(&navigate_handle.state::<DshProcess>());
+                    report_startup_failure(
+                        &navigate_handle,
+                        "DeepSeek Harness server did not start",
+                        "The `dsh web` process reported its web address, but the port never became reachable.\n\nRun `dsh web --no-open` in a terminal to see the underlying error.",
                     );
                     return;
                 }
@@ -537,26 +669,6 @@ fn main() {
                     }
                 });
             });
-
-            // --- Register Ctrl+Q global shortcut to close the window ---
-            #[cfg(desktop)]
-            {
-                let ctrl_q = Shortcut::new(Some(Modifiers::CONTROL), Code::KeyQ);
-                app.handle().plugin(
-                    tauri_plugin_global_shortcut::Builder::new()
-                        .with_handler(move |_app, shortcut, event| {
-                            if shortcut == &ctrl_q
-                                && event.state() == ShortcutState::Pressed
-                            {
-                                if let Some(window) = _app.get_webview_window("main") {
-                                    let _ = window.close();
-                                }
-                            }
-                        })
-                        .build(),
-                )?;
-                app.global_shortcut().register(ctrl_q)?;
-            }
 
             Ok(())
         })
