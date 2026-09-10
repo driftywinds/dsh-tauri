@@ -22,7 +22,10 @@ use url::Url;
 
 const DSH_HOST: &str = "127.0.0.1";
 const DSH_PORT: u16 = 3080;
-const DSH_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cold boots (first run after an update, AV scans, busy machine) can
+/// outlast a tight window; dsh prints nothing until its whole plugin tree
+/// has settled, so this budget covers the entire silent boot.
+const DSH_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Height, in CSS pixels, of the strip at the top of the window that's
 /// draggable. Everything below this line behaves like normal page content
@@ -40,7 +43,7 @@ const DRAG_REGION_HEIGHT_PX: u32 = 15;
 ///
 /// This is passed to `initialization_script`, which (unlike a one-off
 /// `window.eval(...)` call) is re-injected before *every* page load —
-/// including the initial "about:blank" placeholder and the later
+/// including the initial local placeholder page and the later
 /// navigation to `http://localhost:3080`. A plain `eval` only touches
 /// whatever page happens to be loaded the instant it runs, so it would be
 /// wiped out the moment the window navigates to the real dsh UI.
@@ -88,7 +91,7 @@ fn drag_region_script() -> String {
 /// `getCurrentWindow().close()` is an IPC call, so it requires
 /// `core:window:allow-close` in capabilities/default.json. Like the drag
 /// region script, this is re-injected before *every* page load (including
-/// about:blank and the dsh UI), so it also works on the startup error page.
+/// the local placeholder page, the startup error page, and the dsh UI),
 fn close_shortcut_script() -> String {
     r#"
     (function () {
@@ -145,7 +148,7 @@ fn spawn_dsh() -> std::io::Result<(Child, ChildStdout, ChildStderr)> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
         let mut child = Command::new("cmd")
-            .args(["/C", "dsh", "web", "--no-open"])
+            .args(["/C", "dsh", "web", "--port", "0", "--no-open"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
             // Pipe stderr too so the debug reader thread can relay it.
@@ -166,7 +169,7 @@ fn spawn_dsh() -> std::io::Result<(Child, ChildStdout, ChildStderr)> {
     #[cfg(not(target_os = "windows"))]
     {
         let mut child = Command::new("dsh")
-            .args(["web", "--no-open"])
+            .args(["web", "--port", "0", "--no-open"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -356,12 +359,13 @@ fn extract_dsh_web_url_line(line: &str) -> Option<String> {
     }
 }
 
-/// Renders a fatal-error page into the main window (which sits on
-/// about:blank at startup), replacing the silent white rectangle with the
-/// reason and a hint. The text passes through two encodings, so it is
+/// Renders a fatal-error page into the main window (still showing the local
+/// placeholder page at startup), replacing the silent white rectangle with
+/// the reason and a hint. The text passes through two encodings, so it is
 /// escaped for both: HTML entities (it is assigned via innerHTML) and
 /// JavaScript string escapes (it rides inside an eval'd single-quoted
 /// string) — error text can neither inject markup nor break the script.
+/// The render waits for the document when the eval lands mid-load.
 fn show_error_page(window: &tauri::WebviewWindow, heading: &str, details: &str) {
     let escape = |s: &str| -> String {
         s.replace('&', "&amp;")
@@ -376,12 +380,19 @@ fn show_error_page(window: &tauri::WebviewWindow, heading: &str, details: &str) 
     };
     let script = format!(
         r#"(function () {{
-            document.body.style.cssText = 'margin:0;background:#16171a;color:#d7d7db;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;';
-            document.body.innerHTML = '<div style="max-width:660px;padding:0 32px;">'
-                + '<h1 style="font-size:19px;font-weight:600;color:#ff8080;margin:0 0 14px;">{heading}</h1>'
-                + '<pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;margin:0;color:#c7c7cc;">{details}</pre>'
-                + '<p style="font-size:12px;color:#77777d;margin-top:22px;">You can close this window.</p>'
-                + '</div>';
+            function render() {{
+                document.body.style.cssText = 'margin:0;background:#151517;color:#cfd3d6;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;';
+                document.body.innerHTML = '<div style="max-width:660px;padding:0 32px;">'
+                    + '<h1 style="font-size:19px;font-weight:600;color:#ff8080;margin:0 0 14px;">{heading}</h1>'
+                    + '<pre style="white-space:pre-wrap;font-size:13px;line-height:1.6;margin:0;color:#cfd3d6;">{details}</pre>'
+                    + '<p style="font-size:12px;color:#adb2b8;margin-top:22px;">You can close this window.</p>'
+                    + '</div>';
+            }}
+            if (document.readyState === 'loading') {{
+                document.addEventListener('DOMContentLoaded', render);
+            }} else {{
+                render();
+            }}
         }})();"#,
         heading = escape(heading),
         details = escape(details),
@@ -571,9 +582,19 @@ fn main() {
                 // carries the per-process `?token=...`) shows up, the deadline
                 // expires, or stdout closes because dsh exited.
                 let authenticated_url = loop {
-                    match line_rx
-                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        eprintln!(
+                            "[dsh-tauri] Timed out after {}s waiting for the dsh web URL on stdout",
+                            DSH_READY_TIMEOUT.as_secs()
+                        );
+                        break None;
+                    }
+                    // Slice the wait so the terminal shows progress during
+                    // long silent boots — dsh prints nothing until its whole
+                    // plugin tree settles, so a slow start is otherwise
+                    // indistinguishable from a hang.
+                    match line_rx.recv_timeout(remaining.min(Duration::from_secs(10))) {
                         Ok(line) => {
                             if let Some(url) = extract_dsh_web_url_line(&line) {
                                 eprintln!("[dsh-tauri] Extracted authenticated URL: {url}");
@@ -583,10 +604,9 @@ fn main() {
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                             eprintln!(
-                                "[dsh-tauri] Timed out after {}s waiting for the dsh web URL on stdout",
-                                DSH_READY_TIMEOUT.as_secs()
+                                "[dsh-tauri] Still waiting for the dsh web URL… {}s of budget left",
+                                deadline.saturating_duration_since(Instant::now()).as_secs()
                             );
-                            break None;
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             eprintln!("[dsh-tauri] dsh web closed stdout before printing the URL");
@@ -607,18 +627,27 @@ fn main() {
                     report_startup_failure(
                         &navigate_handle,
                         "DeepSeek Harness server did not start",
-                        "The `dsh web` process never reported its web address.\n\nPossible causes:\n  - the `dsh` CLI crashed at startup\n  - port 3080 is already taken by another program\n  - the server needed longer than the 30 second startup budget\n\nRun `dsh web --no-open` in a terminal to see the underlying error.",
+                        "The `dsh web` process never reported its web address.\n\nPossible causes:\n  - the `dsh` CLI crashed at startup\n  - the server needed longer than the 60 second startup budget\n\nRun `dsh web` in a terminal to see the underlying error.",
                     );
                     return;
                 };
 
                 // The URL is printed once the server is listening (or very
                 // shortly after), but wait for the port to be reachable so we
-                // don't race the TCP listen socket. What remains of the global
-                // deadline bounds this wait too.
+                // don't race the TCP listen socket. Wait on the exact address
+                // dsh printed: with `--port 0` the child binds an OS-assigned
+                // port, not DSH_PORT. What remains of the global deadline
+                // bounds this wait too.
+                let (wait_host, wait_port) = match Url::parse(&authenticated_url) {
+                    Ok(u) => (
+                        u.host_str().unwrap_or(DSH_HOST).to_string(),
+                        u.port_or_known_default().unwrap_or(DSH_PORT),
+                    ),
+                    Err(_) => (DSH_HOST.to_string(), DSH_PORT),
+                };
                 if !wait_for_port(
-                    DSH_HOST,
-                    DSH_PORT,
+                    &wait_host,
+                    wait_port,
                     deadline.saturating_duration_since(Instant::now()),
                 ) {
                     eprintln!("[dsh-tauri] Port {DSH_PORT} never became reachable. Giving up.");
@@ -636,7 +665,7 @@ fn main() {
                 // time the closure runs.  Calling navigate() from a raw thread
                 // races window creation (which Tauri queues on the event loop
                 // during from_config+build), and a lost race leaves you staring
-                // at about:blank with a silent failure.
+                // at the blank placeholder page with a silent failure.
                 let url_for_main = authenticated_url.clone();
                 let closure_handle = navigate_handle.clone();
                 let _ = navigate_handle.run_on_main_thread(move || {

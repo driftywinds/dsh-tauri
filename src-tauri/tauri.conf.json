@@ -12,9 +12,10 @@
       {
         "label": "main",
         "title": "DeepSeek Harness",
-        "url": "about:blank",
+        "url": "index.html",
         "visible": true,
         "decorations": false,
+        "backgroundColor": "#151517",
         "width": 1280,
         "height": 860,
         "minWidth": 800,

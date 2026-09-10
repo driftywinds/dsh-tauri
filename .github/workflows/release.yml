@@ -184,9 +184,10 @@ jobs:
             && mv tmp.json src-tauri/tauri.conf.json
           echo "  tauri.conf.json -> $VERSION"
 
-      # dist/index.html is a tiny placeholder committed to the repo as the
-      # frontendDist that tauri build requires.  Double-check it exists
-      # (if the file was somehow omitted from checkout, recreate it).
+      # dist/index.html is a placeholder committed to the repo as the
+      # frontendDist that tauri build requires — styled after the dsh web
+      # client's own dark boot page. Double-check it exists (if the file was
+      # somehow omitted from checkout, recreate it).
       - name: Ensure dist/index.html exists
         shell: bash
         run: |
@@ -195,8 +196,19 @@ jobs:
             cat > dist/index.html <<'EOF'
           <!doctype html>
           <html>
-            <head><meta charset="utf-8" /><title>DeepSeek Harness</title></head>
-            <body>Loading DeepSeek Harness…</body>
+            <head><meta charset="utf-8" /><title>DeepSeek Harness</title>
+            <style>
+              html,body{margin:0;height:100%;background:#151517}
+              body{display:grid;place-items:center;font-family:system-ui,sans-serif}
+              .card{display:flex;flex-direction:column;align-items:center;gap:16px}
+              .wordmark{font-size:16px;font-weight:600;letter-spacing:.08em;color:#f9fafb}
+              .hint{font-size:12px;color:#adb2b8}
+              .spinner{width:20px;height:20px;border-radius:50%;border:2px solid rgba(255,255,255,.12);border-top-color:#f9fafb;animation:s .8s linear infinite}
+              @keyframes s{to{transform:rotate(360deg)}}
+            </style></head>
+            <body>
+              <div class="card"><div class="spinner"></div><div class="wordmark">DeepSeek Harness</div><div class="hint">Starting the DeepSeek Harness server&hellip;</div></div>
+            </body>
           </html>
           EOF
           fi

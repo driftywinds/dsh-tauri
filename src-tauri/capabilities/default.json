@@ -1,12 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Minimal capability for the main window. The dsh web UI uses no Tauri IPC of its own; the only consumers are the two injected scripts (drag region and the Ctrl+Q close shortcut), so only core defaults plus those two window permissions are granted. Downloads are handled Rust-side via on_download and uploads use the standard file input, so fs/dialog/shell/global-shortcut permissions were removed: they granted the remote page (http://127.0.0.1:3080) unused filesystem/shell reach that only expanded the attack surface.",
+  "description": "Minimal capability for the main window. The dsh web UI uses no Tauri IPC of its own; the only consumers are the two injected scripts (drag region and the Ctrl+Q close shortcut), so only core defaults plus those two window permissions are granted. The wrapper launches `dsh web --port 0`, so the UI may be served on any OS-assigned loopback port — the remote scope matches any 127.0.0.1 port for that reason. Downloads are handled Rust-side via on_download and uploads use the standard file input, so fs/dialog/shell/global-shortcut permissions were removed: they granted the remote page unused filesystem/shell reach that only expanded the attack surface.",
   "windows": ["main"],
   "remote": {
     "urls": [
-      "http://127.0.0.1:3080/*",
-      "http://127.0.0.1:3080/**"
+      "http://127.0.0.1:*/*",
+      "http://127.0.0.1:*/**"
     ]
   },
   "permissions": [
